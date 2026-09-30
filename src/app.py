@@ -5,19 +5,66 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+import hashlib
+import hmac
+import json
 import os
+import secrets
 from pathlib import Path
 
-app = FastAPI(title="Mergington High School API",
-              description="API for viewing and signing up for extracurricular activities")
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware import Middleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
+
+session_secret = os.environ.get("SESSION_SECRET") or secrets.token_urlsafe(32)
+cookie_secure = os.environ.get("COOKIE_SECURE", "").lower() in {"1", "true", "yes"}
+app = FastAPI(
+    title="Mergington High School API",
+    description="API for viewing and signing up for extracurricular activities",
+    middleware=[
+        Middleware(
+            SessionMiddleware,
+            secret_key=session_secret,
+            same_site="lax",
+            https_only=cookie_secure,
+        )
+    ],
+)
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
+teachers_file = current_dir / "teachers.json"
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def require_teacher(request: Request):
+    username = request.session.get("teacher")
+    if not username:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return username
+
+
+def verify_teacher(username: str, password: str) -> bool:
+    try:
+        credentials = json.loads(teachers_file.read_text()).get("teachers", {})
+        teacher = credentials.get(username)
+        salt = teacher["salt"]
+        expected_hash = teacher["password_hash"]
+        actual_hash = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), salt.encode(), 310_000
+        ).hex()
+        return hmac.compare_digest(actual_hash, expected_hash)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
 
 # In-memory activity database
 activities = {
@@ -88,8 +135,33 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login(credentials: LoginRequest, request: Request):
+    if not verify_teacher(credentials.username, credentials.password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    request.session["teacher"] = credentials.username
+    return {"username": credentials.username}
+
+
+@app.get("/auth/session")
+def get_session(request: Request):
+    username = request.session.get("teacher")
+    return {"authenticated": bool(username), "username": username}
+
+
+@app.post("/auth/logout")
+def logout(request: Request):
+    request.session.clear()
+    return {"message": "Logged out"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    _teacher: str = Depends(require_teacher),
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +183,11 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    _teacher: str = Depends(require_teacher),
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
